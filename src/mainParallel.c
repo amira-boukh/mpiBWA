@@ -1358,9 +1358,8 @@ void map_indexes(char *file_map, int *count, bwaidx_t *indix, int *ignore_alt, M
 //			count of top level elements in the file
 //			header string
 //			rg = read group string
-void create_sam_header(char *file_out, bwaidx_t *indix, int *count, char *hdr_line, char *rg_line, int rank_num)
+void create_sam_header(char *file_out, bwaidx_t *indix, int *count, char *hdr_line, char *rg_line, int rank_num,int write_format, int compression_level)
 {
-
 	//MPI resources
 	MPI_File fh_out;
 	MPI_Status status;
@@ -1368,53 +1367,163 @@ void create_sam_header(char *file_out, bwaidx_t *indix, int *count, char *hdr_li
 	//non MPI related resources
 	int bef,aft;
 	int res;
+	struct stat stat_file_out;
+
+
+	if(rank_num ==0){
+		if ( stat(file_out, &stat_file_out)  != -1 ) {
+		    res = MPI_File_delete(file_out, MPI_INFO_NULL);
+		    assert(res == MPI_SUCCESS);
+		}
+	}
+				
+	res = MPI_File_open(MPI_COMM_WORLD, file_out, MPI_MODE_CREATE|MPI_MODE_WRONLY|MPI_MODE_APPEND, MPI_INFO_NULL, &fh_out);
+	assert(res == MPI_SUCCESS);
 	
 	//the rank 0 takes care of that task
 	if (rank_num == 0) {
 		int s, len;
 		char *buff;
-		struct stat stat_file_out;
 
 		//We test if the output sam exists
-		if ( stat(file_out, &stat_file_out)  != -1 ) {
+		/*if ( stat(file_out, &stat_file_out)  != -1 ) {
 		    res = MPI_File_delete(file_out, MPI_INFO_NULL);
 		    assert(res == MPI_SUCCESS);
 		}
 				
 		res = MPI_File_open(MPI_COMM_SELF, file_out, MPI_MODE_CREATE|MPI_MODE_WRONLY, MPI_INFO_NULL, &fh_out);
-		assert(res == MPI_SUCCESS);
+		assert(res == MPI_SUCCESS);*/
 		/* Add reference sequence lines */
 		for (s = 0; s < (*indix).bns->n_seqs; ++s) {
-		len = asprintf(&buff, "@SQ\tSN:%s\tLN:%d\n", (*indix).bns->anns[s].name, (*indix).bns->anns[s].len);
-		res = MPI_File_write(fh_out, buff, len, MPI_CHAR, &status);
-		assert(res == MPI_SUCCESS);
-		res = MPI_Get_count(&status, MPI_CHAR, count);
-		assert(res == MPI_SUCCESS);
-		assert(*count == len);
-		free(buff);
+			len = asprintf(&buff, "@SQ\tSN:%s\tLN:%d\n", (*indix).bns->anns[s].name, (*indix).bns->anns[s].len);
+			/*res = MPI_File_write(fh_out, buff, len, MPI_CHAR, &status);
+			assert(res == MPI_SUCCESS);
+			res = MPI_Get_count(&status, MPI_CHAR, count);
+			assert(res == MPI_SUCCESS);
+			assert(*count == len);
+			free(buff);*/
 		}
 		/* Add header lines */
 		if (hdr_line != NULL) {
-		len = asprintf(&buff, "%s\n", hdr_line);
-		res = MPI_File_write(fh_out, buff, len, MPI_CHAR, &status);
-		assert(res == MPI_SUCCESS);
-		res = MPI_Get_count(&status, MPI_CHAR, count);
-		assert(res == MPI_SUCCESS);
-		assert(*count == len);
-		free(buff);
+			len += asprintf(&buff, "%s\n", hdr_line);
+			/*res = MPI_File_write(fh_out, buff, len, MPI_CHAR, &status);
+			assert(res == MPI_SUCCESS);
+			res = MPI_Get_count(&status, MPI_CHAR, count);
+			assert(res == MPI_SUCCESS);
+			assert(*count == len);
+			free(buff);*/
 		}
 		/* Add read group line */
 		if (rg_line != NULL) {
-		len = asprintf(&buff, "%s\n", rg_line);
-		res = MPI_File_write(fh_out, buff, len, MPI_CHAR, &status);
-		assert(res == MPI_SUCCESS);
-		res = MPI_Get_count(&status, MPI_CHAR, count);
-		assert(res == MPI_SUCCESS);
-		assert(*count == len);
-		free(buff);
+			len += asprintf(&buff, "%s\n", rg_line);
+			/*res = MPI_File_write(fh_out, buff, len, MPI_CHAR, &status);
+			assert(res == MPI_SUCCESS);
+			res = MPI_Get_count(&status, MPI_CHAR, count);
+			assert(res == MPI_SUCCESS);
+			assert(*count == len);
+			free(buff);*/
 		}
-		res = MPI_File_close(&fh_out);
-		assert(res == MPI_SUCCESS);
+		
+		if (write_format == 2) {
+				fprintf(stderr,"write format : %d",write_format);
+				res = MPI_File_write_shared(fh_out, buff, len, MPI_CHAR, &status);
+				fprintf(stderr,"Error buff : %d ",status.MPI_ERROR);
+
+				assert(res == MPI_SUCCESS);
+				res = MPI_Get_count(&status, MPI_CHAR, count);
+				assert(res == MPI_SUCCESS);
+				assert(*count == len);
+				free(buff);
+				//res = MPI_File_close(&fh_out);
+				//assert(res == MPI_SUCCESS);
+			}	
+
+		if ( (write_format == 0) || (write_format == 1) ) {
+
+				BGZF *fp_header;
+				fp_header = calloc(1, sizeof(BGZF));
+				uint8_t *compressed_header = malloc(strlen(buff) * sizeof(uint8_t));
+				assert(compressed_header);
+				int compressed_size_header = 0;
+
+				int block_length = MAX_BLOCK_SIZE;
+				int bytes_written;
+				int length = strlen(buff);
+
+				fp_header->open_mode = 'w';
+				fp_header->uncompressed_block_size = MAX_BLOCK_SIZE;
+				fp_header->uncompressed_block = malloc(MAX_BLOCK_SIZE);
+				fp_header->compressed_block_size = MAX_BLOCK_SIZE;
+				fp_header->compressed_block = malloc(MAX_BLOCK_SIZE);
+				fp_header->cache_size = 0;
+				fp_header->cache = kh_init(cache);
+
+				fp_header->block_address = 0;
+				fp_header->block_offset = 0;
+				fp_header->block_length = 0;
+				fp_header->compress_level = compression_level < 0? Z_DEFAULT_COMPRESSION : compression_level; // Z_DEFAULT_COMPRESSION==-1
+
+				if (fp_header->compress_level > 9) fp_header->compress_level = Z_DEFAULT_COMPRESSION;
+
+				const bgzf_byte_t *input = (void *)buff;
+
+				fprintf(stderr,"Buffer : %s\n", buff);
+
+				if (fp_header->uncompressed_block == NULL) {
+					fp_header->uncompressed_block = malloc(fp_header->uncompressed_block_size);
+				}
+
+				input = (void *)buff;
+				block_length = fp_header->uncompressed_block_size;
+				bytes_written = 0;
+
+
+				while (bytes_written < length) {
+					int copy_length = bgzf_min(block_length - fp_header->block_offset, length - bytes_written);
+					bgzf_byte_t* buffer = fp_header->uncompressed_block;
+
+					//fprintf(stderr, "rank %d :::: block_length = %d Compressed Bloc : %ld %ld\n", rank_num, copy_length, strlen(input), strlen(buffer + fp_header->block_offset));
+					memcpy(buffer + fp_header->block_offset, input, copy_length);
+					fp_header->block_offset += copy_length;
+					input += copy_length;
+					bytes_written += copy_length;
+					fprintf(stderr,"Block offset : %d \n", fp_header->block_offset);
+
+					//if (fp->block_offset == block_length) {
+					//we copy in a temp buffer
+					while (fp_header->block_offset > 0) {
+						int block_length;
+						block_length = deflate_block(fp_header, fp_header->block_offset);
+						fprintf(stderr, "rank %d :::: block_length = %d\n", rank_num, block_length);
+
+						memcpy(compressed_header + compressed_size_header, fp_header->compressed_block, block_length );
+						compressed_size_header += block_length;
+						fp_header->block_address += block_length;
+						
+					}
+					//}
+
+				}
+
+				fprintf(stderr,"Compressed header : %d\n",*compressed_header);
+				kh_destroy(cache,fp_header->cache);
+				//free(buff); 
+				size_t compSize = compressed_size_header;
+				//char *toto = "TEST\n";
+				res = MPI_File_write_shared(fh_out, compressed_header, compSize, MPI_BYTE, &status);
+				assert(res == MPI_SUCCESS);
+				res = MPI_Get_count(&status, MPI_BYTE, count);
+				assert(res == MPI_SUCCESS);
+				assert(*count == (int)compSize);
+				//free(compressed_header);
+				//free(fp_header->uncompressed_block);
+				//free(fp_header->compressed_block);
+				//free_cache(fp_header);
+			    //res = MPI_File_close(&fh_out);
+				//assert(res == MPI_SUCCESS);
+			
+			}
+
 	}
 	bef = MPI_Wtime();
 	res = MPI_Barrier(MPI_COMM_WORLD);
@@ -1530,7 +1639,7 @@ int main(int argc, char *argv[]) {
 	bwaidx_t indix;
 	bseq1_t *seqs;
 
-	write_format = 0;
+	write_format = 2;
 	compression_level = 3;
 
 
@@ -2208,19 +2317,42 @@ int main(int argc, char *argv[]) {
 		 * TODO: Add line for BWA version
 		 */
 
+		//We test if the output sam exists
+		if(rank_num == 0){
+			if ( stat(path, &stat_path)  != -1 ) {
+				res = MPI_File_delete(path, MPI_INFO_NULL);
+				assert(res == MPI_SUCCESS);
+			}
+		}
+
         
+		if (file_r1 != NULL) {
+			//fprintf(stderr, "rank %d ::: open file %s \n",rank_num, file_r1);
+			res = MPI_File_open(MPI_COMM_WORLD, file_r1, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh_r1);
+			assert(res == MPI_SUCCESS);
+		}
+		if (file_r2 != NULL) {
+			//fprintf(stderr, "rank %d ::: open file %s \n",rank_num, file_r2);
+			res = MPI_File_open(MPI_COMM_WORLD, file_r2, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh_r2);
+			assert(res == MPI_SUCCESS);
+		}
+
+		res = MPI_File_open(MPI_COMM_WORLD, path, MPI_MODE_WRONLY|MPI_MODE_CREATE|MPI_MODE_APPEND, MPI_INFO_NULL, &fh_out);
+		assert(res == MPI_SUCCESS);
+		//fprintf(stderr, "TEST \n");
+        /*char* toto = "TEST\n";
+	    res = MPI_File_write_shared(fh_out, toto, strlen(toto), MPI_CHAR, &status);
+		assert(res == MPI_SUCCESS);*/
+
+
+		
 
 		if (rank_num == 0) {
 			int s, len;
 			char *buff;
 			
-			//We test if the output sam exists
-			if ( stat(path, &stat_path)  != -1 ) {
-				res = MPI_File_delete(path, MPI_INFO_NULL);
-				assert(res == MPI_SUCCESS);
-			}
-			res = MPI_File_open(MPI_COMM_SELF, path, MPI_MODE_CREATE|MPI_MODE_WRONLY, MPI_INFO_NULL, &fh_out);
-			assert(res == MPI_SUCCESS);
+			
+			
 
 			/* Add reference sequence lines */
 			for (s = 0; s < indix.bns->n_seqs; ++s) {
@@ -2252,16 +2384,20 @@ int main(int argc, char *argv[]) {
 				assert(count == len);
 				free(buff);*/
 			}
+			//fprintf(stderr,"Buffer : %s",buff);
 
 			if (write_format == 2) {
-				res = MPI_File_write(fh_out, buff, len, MPI_CHAR, &status);
+				fprintf(stderr,"write format : %d",write_format);
+				res = MPI_File_write_shared(fh_out, buff, len, MPI_CHAR, &status);
+				fprintf(stderr,"Error buff : %d ",status.MPI_ERROR);
+
 				assert(res == MPI_SUCCESS);
 				res = MPI_Get_count(&status, MPI_CHAR, &count);
 				assert(res == MPI_SUCCESS);
 				assert(count == len);
 				free(buff);
-				res = MPI_File_close(&fh_out);
-				assert(res == MPI_SUCCESS);
+				//res = MPI_File_close(&fh_out);
+				//assert(res == MPI_SUCCESS);
 			}	
 
 
@@ -2269,7 +2405,8 @@ int main(int argc, char *argv[]) {
 
 				BGZF *fp_header;
 				fp_header = calloc(1, sizeof(BGZF));
-				uint8_t *compressed_header = NULL;
+				uint8_t *compressed_header = malloc(strlen(buff) * sizeof(uint8_t));
+				assert(compressed_header);
 				int compressed_size_header = 0;
 
 				int block_length = MAX_BLOCK_SIZE;
@@ -2282,6 +2419,8 @@ int main(int argc, char *argv[]) {
 				fp_header->compressed_block_size = MAX_BLOCK_SIZE;
 				fp_header->compressed_block = malloc(MAX_BLOCK_SIZE);
 				fp_header->cache_size = 0;
+				fp_header->cache = kh_init(cache);
+
 				fp_header->block_address = 0;
 				fp_header->block_offset = 0;
 				fp_header->block_length = 0;
@@ -2291,7 +2430,7 @@ int main(int argc, char *argv[]) {
 
 				const bgzf_byte_t *input = (void *)buff;
 
-				fprintf(stderr,"Buffer size: %ld", strlen(fp_header->uncompressed_block));
+				fprintf(stderr,"Buffer : %s\n", buff);
 
 				if (fp_header->uncompressed_block == NULL) {
 					fp_header->uncompressed_block = malloc(fp_header->uncompressed_block_size);
@@ -2300,7 +2439,7 @@ int main(int argc, char *argv[]) {
 				input = (void *)buff;
 				block_length = fp_header->uncompressed_block_size;
 				bytes_written = 0;
-				compressed_header =  malloc(strlen(buff) * sizeof(uint8_t));
+
 
 				while (bytes_written < length) {
 					int copy_length = bgzf_min(block_length - fp_header->block_offset, length - bytes_written);
@@ -2311,33 +2450,39 @@ int main(int argc, char *argv[]) {
 					fp_header->block_offset += copy_length;
 					input += copy_length;
 					bytes_written += copy_length;
+					fprintf(stderr,"Block offset : %d \n", fp_header->block_offset);
+
 					//if (fp->block_offset == block_length) {
 					//we copy in a temp buffer
 					while (fp_header->block_offset > 0) {
 						int block_length;
 						block_length = deflate_block(fp_header, fp_header->block_offset);
-						fprintf(stderr, "rank %d :::: block_length = %d \n", rank_num, block_length);
+						fprintf(stderr, "rank %d :::: block_length = %d\n", rank_num, block_length);
 
-						memcpy(compressed_header + compressed_size_header, fp_header->compressed_block, block_length);
+						memcpy(compressed_header + compressed_size_header, fp_header->compressed_block, block_length );
 						compressed_size_header += block_length;
 						fp_header->block_address += block_length;
+						
 					}
 					//}
 
 				}
-				free(buff); 
+
+				fprintf(stderr,"Compressed header : %d\n",*compressed_header);
+				//kh_destroy(cache,fp_header->cache);
+				//free(buff); 
 				size_t compSize = compressed_size_header;
-				res = MPI_File_write(fh_out, compressed_header, compSize, MPI_BYTE, &status);
+				res = MPI_File_write_shared(fh_out, compressed_header, compSize, MPI_BYTE, &status);
 				assert(res == MPI_SUCCESS);
 				res = MPI_Get_count(&status, MPI_BYTE, &count);
 				assert(res == MPI_SUCCESS);
 				assert(count == (int)compSize);
-				//free(compressed_header);
-				//free(fp_header->uncompressed_block);
-				//free(fp_header->compressed_block);
-				//free_cache(fp_header);
-				res = MPI_File_close(&fh_out);
-				assert(res == MPI_SUCCESS);
+				free(compressed_header);
+				free(fp_header->uncompressed_block);
+				free(fp_header->compressed_block);
+				free_cache(fp_header);
+				//res = MPI_File_close(&fh_out);
+				//assert(res == MPI_SUCCESS);
 			
 			}
 		}
@@ -2351,27 +2496,14 @@ int main(int argc, char *argv[]) {
 		xfprintf(stderr, "%s: synched processes (%.02f)\n", __func__, aft - bef);
 
 
-		res = MPI_File_open(MPI_COMM_WORLD, path, MPI_MODE_WRONLY|MPI_MODE_APPEND, MPI_INFO_NULL, &fh_out);
-		assert(res == MPI_SUCCESS);
-		fprintf(stderr, "TEST \n");
-
-		if (file_r1 != NULL) {
-			//fprintf(stderr, "rank %d ::: open file %s \n",rank_num, file_r1);
-			res = MPI_File_open(MPI_COMM_WORLD, file_r1, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh_r1);
-			assert(res == MPI_SUCCESS);
-		}
-		if (file_r2 != NULL) {
-			//fprintf(stderr, "rank %d ::: open file %s \n",rank_num, file_r2);
-			res = MPI_File_open(MPI_COMM_WORLD, file_r2, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh_r2);
-			assert(res == MPI_SUCCESS);
-		}
+		
 
 
-		fprintf(stderr, "File r1 : %s et File r2 : %s \n",file_r1,file_r2);
+		//fprintf(stderr, "File r1 : %s et File r2 : %s \n",file_r1,file_r2);
 
 		
 
-		fprintf(stderr,"TEST \n");
+		//fprintf(stderr,"TEST \n");
 
 
 		buffer_r1 = buffer_r2 = NULL; seqs = NULL;
@@ -2610,7 +2742,7 @@ int main(int argc, char *argv[]) {
 					fp->compress_level = Z_DEFAULT_COMPRESSION;
 				}
 
-
+				//fprintf(stderr,"buffer : %ld",strlen(buffer_out));
 
 				const bgzf_byte_t *input = (void *)buffer_out;
 
@@ -2646,6 +2778,7 @@ int main(int argc, char *argv[]) {
 						// count = fwrite(fp->compressed_block, 1, block_length, fp->file);
 						// we replace the fwrite with a memcopy
 
+						//fprintf(stderr, "rank %d :::: block_length = %d %ld %ld\n", rank_num, block_length,sizeof(compressed_buff + compressed_size),sizeof(fp->compressed_block));
 
 						memcpy(compressed_buff + compressed_size, fp->compressed_block, block_length);
 						compressed_size += block_length;
@@ -2682,7 +2815,10 @@ int main(int argc, char *argv[]) {
 
 			u1 += proc_num;
 
-		} //end for (u1 = 0; u1 < chunk_count; u1++){
+		} //end for (u1 = 0; u1 < chunk_count; u1++)
+
+		
+
 	} //end if (file_r2 != NULL && stat_r1.st_size == stat_r2.st_size)
 	
 	if (file_r1 != NULL && file_r2 != NULL && stat_r1.st_size != stat_r2.st_size) {
@@ -3107,16 +3243,7 @@ int main(int argc, char *argv[]) {
 		aft = MPI_Wtime();
 		fprintf(stderr, "%s ::: rank %d ::: mapped indexes (%.02f)\n", __func__, rank_num, aft - bef);
 
-		///Create SAM header
-		//TODO: Add line for BWA version
-		create_sam_header(path, &indix, &count, hdr_line, rg_line, rank_num);
-
-		///This is a testline to stop the program wherever I want
-		if(0){ MPI_Barrier(MPI_COMM_WORLD); MPI_Finalize(); return 0;}
-
-		res = MPI_File_open(MPI_COMM_WORLD, path, MPI_MODE_WRONLY|MPI_MODE_APPEND, MPI_INFO_NULL, &fh_out);
-		assert(res == MPI_SUCCESS);
-
+		
 		if (file_r1 != NULL) {
 			//fprintf(stderr, "rank %d ::: open file %s \n",rank_num, file_r1);
 			res = MPI_File_open(MPI_COMM_WORLD, file_r1, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh_r1);
@@ -3127,6 +3254,21 @@ int main(int argc, char *argv[]) {
 			res = MPI_File_open(MPI_COMM_WORLD, file_r2, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh_r2);
 			assert(res == MPI_SUCCESS);
 		}
+		
+
+		///Create SAM header
+		//TODO: Add line for BWA version
+		create_sam_header(path, &indix, &count, hdr_line, rg_line, rank_num,write_format, compression_level);
+
+		///This is a testline to stop the program wherever I want
+		if(0){ MPI_Barrier(MPI_COMM_WORLD); MPI_Finalize(); return 0;}
+
+		res = MPI_File_open(MPI_COMM_WORLD, path, MPI_MODE_WRONLY|MPI_MODE_APPEND, MPI_INFO_NULL, &fh_out);
+		assert(res == MPI_SUCCESS);
+
+		
+
+		
 
 		buffer_r1 = buffer_r2 = NULL; seqs = NULL;
 		before_local_mapping = MPI_Wtime();
@@ -3344,18 +3486,122 @@ int main(int argc, char *argv[]) {
 				free(seqs[n].sam); 
 			}
 			free(seqs);
-			res = MPI_File_write_shared(fh_out, buffer_out, localsize, MPI_CHAR, &status);
-			assert(res == MPI_SUCCESS);
-			res = MPI_Get_count(&status, MPI_CHAR, &count);
-			assert(res == MPI_SUCCESS);
-			assert(count == (int)localsize);
-			free(buffer_out);
-			aft = MPI_Wtime();
-			fprintf(stderr, "rank: %d :: %s: wrote results (%.02f) \n", rank_num, __func__, aft - bef);
-			total_time_writing += (aft - bef);
-			free(buffer_r1);
-			free(buffer_r2);
-			fprintf(stderr, "rank: %d :: finish for chunck %zu \n", rank_num, u1);
+
+			if (write_format == 2) {
+				res = MPI_File_write_shared(fh_out, buffer_out, localsize, MPI_CHAR, &status);
+				assert(res == MPI_SUCCESS);
+				res = MPI_Get_count(&status, MPI_CHAR, &count);
+				assert(res == MPI_SUCCESS);
+				assert(count == (int)localsize);
+				free(buffer_out);
+				aft = MPI_Wtime();
+				fprintf(stderr, "%s: wrote results (%.02f)\n", __func__, aft - bef);
+				total_time_writing += (aft - bef);
+				free(buffer_r1);
+				free(buffer_r2);
+			}
+
+			if ((write_format == 0) || (write_format == 1)) {
+
+				uint8_t *compressed_buff =  malloc((strlen(buffer_out))* sizeof(uint8_t));
+				assert(compressed_buff);	
+				size_t compressed_size =0;
+				BGZF *fp;
+				fp = calloc(1, sizeof(BGZF));
+
+				int block_length = MAX_BLOCK_SIZE;
+				int bytes_written;
+				int length = strlen(buffer_out);
+
+				fp->open_mode = 'w';
+				fp->uncompressed_block_size = MAX_BLOCK_SIZE;
+				fp->uncompressed_block = malloc(MAX_BLOCK_SIZE);
+
+				fp->compressed_block_size = MAX_BLOCK_SIZE;
+				fp->compressed_block = malloc(MAX_BLOCK_SIZE);
+				fp->cache_size = 0;
+				fp->cache = kh_init(cache);
+				fp->block_address = 0;
+				fp->block_offset = 0;
+				fp->block_length = 0;
+				fp->compress_level = compression_level < 0 ? Z_DEFAULT_COMPRESSION : compression_level; // Z_DEFAULT_COMPRESSION==-1
+
+				if (fp->compress_level > 9) {
+					fp->compress_level = Z_DEFAULT_COMPRESSION;
+				}
+
+				//fprintf(stderr,"buffer : %ld",strlen(buffer_out));
+
+				const bgzf_byte_t *input = (void *)buffer_out;
+
+				if (fp->uncompressed_block == NULL) {
+					fp->uncompressed_block = malloc(fp->uncompressed_block_size);
+				}
+				
+				input = (void *)buffer_out;
+				block_length = fp->uncompressed_block_size;
+				bytes_written = 0;
+
+				//if (rank == master_job_phase_2) {
+				//    fprintf(stderr, "rank %d :::: start loop compression \n", rank);
+				//}
+
+				while (bytes_written < length) {
+					int copy_length = bgzf_min(block_length - fp->block_offset, length - bytes_written);
+					bgzf_byte_t *buffer = fp->uncompressed_block;
+					memcpy(buffer + fp->block_offset, input, copy_length);
+					fp->block_offset += copy_length;
+					input += copy_length;
+					bytes_written += copy_length;
+
+					//if (fp->block_offset == block_length) {
+					//we copy in a temp buffer
+					while (fp->block_offset > 0) {
+						int block_length;
+						block_length = deflate_block(fp, fp->block_offset);
+
+						//is it necessary?
+						//if (block_length < 0) break;
+
+						// count = fwrite(fp->compressed_block, 1, block_length, fp->file);
+						// we replace the fwrite with a memcopy
+
+						//fprintf(stderr, "rank %d :::: block_length = %d %ld %ld\n", rank_num, block_length,sizeof(compressed_buff + compressed_size),sizeof(fp->compressed_block));
+
+						memcpy(compressed_buff + compressed_size, fp->compressed_block, block_length);
+						compressed_size += block_length;
+						fp->block_address += block_length;
+					}
+
+					//}
+				}
+
+				if ( (write_format == 1) ){
+					static uint8_t magic[28] =  "\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00\x42\x43\x02\x00\x1b\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+					memcpy(compressed_buff + compressed_size, magic, 28);
+					compressed_size += 28;
+				}	
+
+				kh_destroy(cache, fp->cache);
+				free(buffer_out);
+				size_t compSize = compressed_size;	
+
+				res = MPI_File_write_shared(fh_out, compressed_buff, compSize, MPI_BYTE, &status);
+				assert(res == MPI_SUCCESS);
+				res = MPI_Get_count(&status, MPI_BYTE, &count);
+				assert(res == MPI_SUCCESS);
+				assert(count == (int)compSize);
+				free(compressed_buff);
+				aft = MPI_Wtime();
+				fprintf(stderr, "%s: wrote results (%.02f)\n", __func__, aft - bef);
+				total_time_writing += (aft - bef);
+				free(buffer_r1);
+				free(buffer_r2);
+
+
+			}
+
+
 
 			u1 += proc_num;
 
@@ -3656,9 +3902,14 @@ int main(int argc, char *argv[]) {
 		aft = MPI_Wtime();
 		fprintf(stderr, "%s ::: rank %d ::: mapped indexes (%.02f)\n", __func__, rank_num, aft - bef);
 
+		if (file_r1 != NULL) {
+			//fprintf(stderr, "rank %d ::: open file %s \n",rank_num, file_r1);
+			res = MPI_File_open(MPI_COMM_WORLD, file_r1, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh_r1);
+			assert(res == MPI_SUCCESS);
+		}
 		///Create SAM header
 		//TODO: Add line for BWA version
-		create_sam_header(path, &indix, &count, hdr_line, rg_line, rank_num);
+		create_sam_header(path, &indix, &count, hdr_line, rg_line, rank_num,write_format,compression_level);
 
 		///This is a testline to stop the program wherever I want
 		if(0){ MPI_Barrier(MPI_COMM_WORLD); MPI_Finalize(); return 0;}
@@ -3666,11 +3917,7 @@ int main(int argc, char *argv[]) {
 		res = MPI_File_open(MPI_COMM_WORLD, path, MPI_MODE_WRONLY|MPI_MODE_APPEND, MPI_INFO_NULL, &fh_out);
 		assert(res == MPI_SUCCESS);
 
-		if (file_r1 != NULL) {
-			//fprintf(stderr, "rank %d ::: open file %s \n",rank_num, file_r1);
-			res = MPI_File_open(MPI_COMM_WORLD, file_r1, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh_r1);
-			assert(res == MPI_SUCCESS);
-		}
+		
 		
 		buffer_r1 = NULL; seqs = NULL;
 		before_local_mapping = MPI_Wtime();
@@ -3799,17 +4046,120 @@ int main(int argc, char *argv[]) {
 				free(seqs[n].sam); 
 			}
 			free(seqs);
-			res = MPI_File_write_shared(fh_out, buffer_out, localsize, MPI_CHAR, &status);
-			assert(res == MPI_SUCCESS);
-			res = MPI_Get_count(&status, MPI_CHAR, &count);
-			assert(res == MPI_SUCCESS);
-			assert(count == (int)localsize);
-			free(buffer_out);
-			aft = MPI_Wtime();
-			fprintf(stderr, "rank: %d :: %s: wrote results (%.02f) \n", rank_num, __func__, aft - bef);
-			total_time_writing += (aft - bef);
-			free(buffer_r1);
-			fprintf(stderr, "rank: %d :: finish for chunck %zu \n", rank_num, u1);
+			
+			if (write_format == 2) {
+				res = MPI_File_write_shared(fh_out, buffer_out, localsize, MPI_CHAR, &status);
+				assert(res == MPI_SUCCESS);
+				res = MPI_Get_count(&status, MPI_CHAR, &count);
+				assert(res == MPI_SUCCESS);
+				assert(count == (int)localsize);
+				free(buffer_out);
+				aft = MPI_Wtime();
+				fprintf(stderr, "%s: wrote results (%.02f)\n", __func__, aft - bef);
+				total_time_writing += (aft - bef);
+				free(buffer_r1);
+				free(buffer_r2);
+			}
+
+			if ((write_format == 0) || (write_format == 1)) {
+
+				uint8_t *compressed_buff =  malloc((strlen(buffer_out))* sizeof(uint8_t));
+				assert(compressed_buff);	
+				size_t compressed_size =0;
+				BGZF *fp;
+				fp = calloc(1, sizeof(BGZF));
+
+				int block_length = MAX_BLOCK_SIZE;
+				int bytes_written;
+				int length = strlen(buffer_out);
+
+				fp->open_mode = 'w';
+				fp->uncompressed_block_size = MAX_BLOCK_SIZE;
+				fp->uncompressed_block = malloc(MAX_BLOCK_SIZE);
+
+				fp->compressed_block_size = MAX_BLOCK_SIZE;
+				fp->compressed_block = malloc(MAX_BLOCK_SIZE);
+				fp->cache_size = 0;
+				fp->cache = kh_init(cache);
+				fp->block_address = 0;
+				fp->block_offset = 0;
+				fp->block_length = 0;
+				fp->compress_level = compression_level < 0 ? Z_DEFAULT_COMPRESSION : compression_level; // Z_DEFAULT_COMPRESSION==-1
+
+				if (fp->compress_level > 9) {
+					fp->compress_level = Z_DEFAULT_COMPRESSION;
+				}
+
+				//fprintf(stderr,"buffer : %ld",strlen(buffer_out));
+
+				const bgzf_byte_t *input = (void *)buffer_out;
+
+				if (fp->uncompressed_block == NULL) {
+					fp->uncompressed_block = malloc(fp->uncompressed_block_size);
+				}
+				
+				input = (void *)buffer_out;
+				block_length = fp->uncompressed_block_size;
+				bytes_written = 0;
+
+				//if (rank == master_job_phase_2) {
+				//    fprintf(stderr, "rank %d :::: start loop compression \n", rank);
+				//}
+
+				while (bytes_written < length) {
+					int copy_length = bgzf_min(block_length - fp->block_offset, length - bytes_written);
+					bgzf_byte_t *buffer = fp->uncompressed_block;
+					memcpy(buffer + fp->block_offset, input, copy_length);
+					fp->block_offset += copy_length;
+					input += copy_length;
+					bytes_written += copy_length;
+
+					//if (fp->block_offset == block_length) {
+					//we copy in a temp buffer
+					while (fp->block_offset > 0) {
+						int block_length;
+						block_length = deflate_block(fp, fp->block_offset);
+
+						//is it necessary?
+						//if (block_length < 0) break;
+
+						// count = fwrite(fp->compressed_block, 1, block_length, fp->file);
+						// we replace the fwrite with a memcopy
+
+						//fprintf(stderr, "rank %d :::: block_length = %d %ld %ld\n", rank_num, block_length,sizeof(compressed_buff + compressed_size),sizeof(fp->compressed_block));
+
+						memcpy(compressed_buff + compressed_size, fp->compressed_block, block_length);
+						compressed_size += block_length;
+						fp->block_address += block_length;
+					}
+
+					//}
+				}
+
+				if ( (write_format == 1) ){
+					static uint8_t magic[28] =  "\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00\x42\x43\x02\x00\x1b\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+					memcpy(compressed_buff + compressed_size, magic, 28);
+					compressed_size += 28;
+				}	
+
+				kh_destroy(cache, fp->cache);
+				free(buffer_out);
+				size_t compSize = compressed_size;	
+
+				res = MPI_File_write_shared(fh_out, compressed_buff, compSize, MPI_BYTE, &status);
+				assert(res == MPI_SUCCESS);
+				res = MPI_Get_count(&status, MPI_BYTE, &count);
+				assert(res == MPI_SUCCESS);
+				assert(count == (int)compSize);
+				free(compressed_buff);
+				aft = MPI_Wtime();
+				fprintf(stderr, "%s: wrote results (%.02f)\n", __func__, aft - bef);
+				total_time_writing += (aft - bef);
+				free(buffer_r1);
+				free(buffer_r2);
+
+
+			}
 
 			u1 += proc_num;
 		} //end for loop on chunks
